@@ -121,90 +121,12 @@ def read_examples(input_file):
   return examples
 
 
-def model_fn_builder(bert_config, init_checkpoint, use_tpu,
-                     use_one_hot_embeddings):
-  """Returns `model_fn` closure for TPUEstimator."""
-
-  def model_fn(features, mode, params):  # pylint: disable=unused-argument
-    """The `model_fn` for TPUEstimator."""
-
-    tf.logging.info("*** Features ***")
-    for name in sorted(features.keys()):
-      tf.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
-
-    input_ids = features["input_ids"]
-    input_mask = features["input_mask"]
-    segment_ids = features["segment_ids"]
-    masked_lm_positions = features["masked_lm_positions"]
-    masked_lm_ids = features["masked_lm_ids"]
-
-
-    model = modeling.BertModel(
-        config=bert_config,
-        is_training=False,
-        input_ids=input_ids,
-        input_mask=input_mask,
-        token_type_ids=segment_ids,
-        use_one_hot_embeddings=use_one_hot_embeddings)
-
-    # masked_lm_example_loss = get_masked_lm_output(
-    #     bert_config, model.get_sequence_output(), model.get_embedding_table(),
-    #     masked_lm_positions, masked_lm_ids)
-    ##### changed #####
-    (masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
-        bert_config, model.get_sequence_output(), model.get_embedding_table(),
-        masked_lm_positions, masked_lm_ids)
-    #####
-
-    tvars = tf.trainable_variables()
-    initialized_variable_names = {}
-    scaffold_fn = None
-    if init_checkpoint:
-      (assignment_map, initialized_variable_names
-      ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
-      if use_tpu:
-
-        def tpu_scaffold():
-          tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-          return tf.train.Scaffold()
-
-        scaffold_fn = tpu_scaffold
-      else:
-        tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-
-    tf.logging.info("**** Trainable Variables ****")
-    for var in tvars:
-      init_string = ""
-      if var.name in initialized_variable_names:
-        init_string = ", *INIT_FROM_CKPT*"
-      # tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape, init_string)
-
-    output_spec = None
-    if mode == tf.estimator.ModeKeys.PREDICT:
-      ##### changed #####
-      masked_lm_log_probs = tf.reshape(masked_lm_log_probs, [-1, masked_lm_log_probs.shape[-1]])
-      masked_lm_predictions = tf.argmax(masked_lm_log_probs, axis=-1, output_type=tf.int32)
-      output = {"masked_lm_log_probs": masked_lm_log_probs,
-        "masked_lm_predictions": masked_lm_predictions
-      }
-      
-      # output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-      #     mode=mode, predictions=masked_lm_example_loss, scaffold_fn=scaffold_fn)
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-          mode=mode, predictions=output, scaffold_fn=scaffold_fn)
-    return output_spec
-
-  return model_fn
-
-
-
-
 def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
-                         label_ids):
+                         label_ids, scope=None):
   """Get loss and log probs for the masked LM."""
   input_tensor = gather_indexes(input_tensor, positions)
-
-  with tf.variable_scope("cls/predictions"):
+  
+  with tf.variable_scope("cls/predictions", reuse=tf.AUTO_REUSE):
     # We apply one more non-linear transformation before the output layer.
     # This matrix is not used after pre-training.
     with tf.variable_scope("transform"):
@@ -215,7 +137,7 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
           kernel_initializer=modeling.create_initializer(
               bert_config.initializer_range))
       input_tensor = modeling.layer_norm(input_tensor)
-
+      
     # The output weights are the same as the input embeddings, but there is
     # an output-only bias for each token.
     output_bias = tf.get_variable(
@@ -231,11 +153,12 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
     one_hot_labels = tf.one_hot(
         label_ids, depth=bert_config.vocab_size, dtype=tf.float32)
     per_example_loss = -tf.reduce_sum(log_probs * one_hot_labels, axis=[-1])
+
     loss = tf.reshape(per_example_loss, [-1, tf.shape(positions)[1]])
+    
     # TODO: dynamic gather from per_example_loss
   # return loss
   return per_example_loss, log_probs
-
 
 
 def gather_indexes(sequence_tensor, positions):
@@ -254,7 +177,7 @@ def gather_indexes(sequence_tensor, positions):
   return output_tensor
 
 
-def input_fn_builder(features, seq_length, max_predictions_per_seq):
+def features_to_dict(features, seq_length, max_predictions_per_seq):
   """Creates an `input_fn` closure to be passed to TPUEstimator."""
 
   all_input_ids = []
@@ -269,48 +192,37 @@ def input_fn_builder(features, seq_length, max_predictions_per_seq):
     all_segment_ids.append(feature.segment_ids)
     all_masked_lm_positions.append(feature.masked_lm_positions)
     all_masked_lm_ids.append(feature.masked_lm_ids)
+  
+  num_examples = len(features)
 
-  def input_fn(params):
-    """The actual input function."""
-    batch_size = params["batch_size"]
-    num_examples = len(features)
+  feature_dict = {
+      "input_ids":
+          tf.constant(
+              all_input_ids, shape=[num_examples, seq_length],
+              dtype=tf.int32),
+      "input_mask":
+          tf.constant(
+              all_input_mask,
+              shape=[num_examples, seq_length],
+              dtype=tf.int32),
+      "segment_ids":
+          tf.constant(
+              all_segment_ids,
+              shape=[num_examples, seq_length],
+              dtype=tf.int32),
+      "masked_lm_positions":
+          tf.constant(
+              all_masked_lm_positions,
+              shape=[num_examples, max_predictions_per_seq],
+              dtype=tf.int32),
+      "masked_lm_ids":
+          tf.constant(
+              all_masked_lm_ids,
+              shape=[num_examples, max_predictions_per_seq],
+              dtype=tf.int32)
+  }
 
-    # This is for demo purposes and does NOT scale to large data sets. We do
-    # not use Dataset.from_generator() because that uses tf.py_func which is
-    # not TPU compatible. The right way to load data is with TFRecordReader.
-    d = tf.data.Dataset.from_tensor_slices({
-        "input_ids":
-            tf.constant(
-                all_input_ids, shape=[num_examples, seq_length],
-                dtype=tf.int32),
-        "input_mask":
-            tf.constant(
-                all_input_mask,
-                shape=[num_examples, seq_length],
-                dtype=tf.int32),
-        "segment_ids":
-            tf.constant(
-                all_segment_ids,
-                shape=[num_examples, seq_length],
-                dtype=tf.int32),
-        "masked_lm_positions":
-            tf.constant(
-                all_masked_lm_positions,
-                shape=[num_examples, max_predictions_per_seq],
-                dtype=tf.int32),
-        "masked_lm_ids":
-            tf.constant(
-                all_masked_lm_ids,
-                shape=[num_examples, max_predictions_per_seq],
-                dtype=tf.int32)
-    })
-
-    # d = d.batch(batch_size=batch_size, drop_remainder=False)
-    d = d.batch(batch_size=batch_size)
-    return d
-
-  return input_fn
-
+  return feature_dict
 
 
 # This function is not used by this file but is still used by the Colab and
@@ -332,18 +244,12 @@ def convert_examples_to_features(examples, max_seq_length, tokenizer):
 
   return all_features, all_tokens
 
-tokenizer = tokenization.FullTokenizer(
-  vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
-MASKED_TOKEN = "[MASK]"
-MASKED_ID = tokenizer.convert_tokens_to_ids([MASKED_TOKEN])[0]
-
-
 def create_masked_lm_prediction(input_ids, mask_position, mask_count=1):
   new_input_ids = list(input_ids)
   masked_lm_labels = []
   masked_lm_positions = list(range(mask_position, mask_position + mask_count))
   for i in masked_lm_positions:
-    new_input_ids[i] = MASKED_ID
+    new_input_ids[i] = 103
     masked_lm_labels.append(input_ids[i])
   return new_input_ids, masked_lm_positions, masked_lm_labels
 
@@ -376,7 +282,7 @@ def process_prediction_input(input_tokens, input_ids, input_mask, segment_ids, m
       break
     new_mask_positions = list(range(mask_position, mask_position + mask_required))
     for pos in new_mask_positions:
-      new_input_ids[pos] = MASKED_ID
+      new_input_ids[pos] = 103
       masked_lm_labels.append(input_ids[pos])
     masked_lm_positions.extend(new_mask_positions)
     mask_count += mask_required
@@ -514,30 +420,36 @@ def parse_result(result, all_tokens, features, output_file=None):
     num_prediction = np.count_nonzero(masked_lm_positions)
     predict_sent = origin_sent.copy()
     for j in range(num_prediction):
-      predict_sent[masked_lm_positions[0][j]-1] = "<" + predict_words[i][j] + ">"
-    
-    predict = predict_sent.copy()
-    l = 0
+      predict_sent[masked_lm_positions[0][j]-1] = "@" + predict_words[i][j]
 
-    for k, word in enumerate(predict_sent):
-      if(word.startswith("##")):
-        try:
-          if(k >= 1):
-            predict[l-1] = predict[l-1] + word[2:]
-            predict = predict[:l] + predict[l+1:]
-            l-=1
-        except Exception as e:
-          print(e)
-          print('predict_sent')
-          print(predict_sent)
-          print('length: %d k: %d' % (len(predict_sent), k))
-      l+=1
-
-    
     print("origin__sent: ", ' '.join(origin_sent))
     print("predict_sent: ", ' '.join(predict_sent))
-    print("predict     : ", ' '.join(predict))
-    print()
+
+
+def prediction(model, bert_config, masked_index, masked_id, scope=None):
+  (masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
+      bert_config, model.get_sequence_output(), model.get_embedding_table(),
+      tf.constant(masked_index, name="masked_lm_positions"),
+      tf.constant(masked_id, name="masked_lm_ids"), scope=scope)
+  
+  tvars = tf.trainable_variables()
+  initialized_variable_names = {}
+  if FLAGS.init_checkpoint:
+      (assignment_map, initialized_variable_names) = modeling.get_assignment_map_from_checkpoint(tvars, FLAGS.init_checkpoint)
+      tf.train.init_from_checkpoint(FLAGS.init_checkpoint, assignment_map)
+  
+  for var in tvars:
+    init_string = ""
+    if var.name in initialized_variable_names:
+      init_string = ", *INIT_FROM_CKPT*"
+    
+  masked_lm_log_probs = tf.reshape(masked_lm_log_probs, [-1, masked_lm_log_probs.shape[-1]])
+  masked_lm_predictions = tf.argmax(masked_lm_log_probs, axis=-1, output_type=tf.int32)
+  output = {"masked_lm_log_probs": masked_lm_log_probs,
+            "masked_lm_predictions": masked_lm_predictions }
+
+  return output
+
 
 def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
@@ -549,62 +461,77 @@ def main(_):
         "Cannot use sequence length %d because the BERT model "
         "was only trained up to sequence length %d" %
         (FLAGS.max_seq_length, bert_config.max_position_embeddings))
+  
+  tokenizer = tokenization.FullTokenizer(
+    vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
+  MASKED_TOKEN = "[MASK]"
+  MASKED_ID = tokenizer.convert_tokens_to_ids([MASKED_TOKEN])[0]
 
-  tf.gfile.MakeDirs(FLAGS.output_dir)
+  lines = [line.rstrip('\n') for line in open(FLAGS.input_file)]
+  tokenized_text = []
+  for line in lines:
+    tokenized_text = tokenized_text + tokenizer.tokenize(line)
+    tokenized_text.append('[SEP]')
+  
+  tokenized_text.insert(0, '[CLS]')
+  token_len = len(tokenized_text)
+  print(tokenized_text)
 
-  tpu_cluster_resolver = None
-  if FLAGS.use_tpu and FLAGS.tpu_name:
-    tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
-        FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
+  indexed_tokens = tokenizer.convert_tokens_to_ids(tokenized_text)
+  seps = np.where(np.asarray(indexed_tokens) == 102)[0]
+  print(seps)
 
-  is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-  tf.logging.info('run_config 생성')
-  run_config = tf.contrib.tpu.RunConfig(
-      cluster=tpu_cluster_resolver,
-      master=FLAGS.master,
-      model_dir=FLAGS.output_dir,
-      tpu_config=tf.contrib.tpu.TPUConfig(
-          num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host))
+  segments_ids = np.zeros(token_len, dtype=int)
+  if len(seps) > 1:
+    segments_ids[seps[0] + 1:] = int(1)
+  print(segments_ids)
 
-  tf.logging.info('model_fn 생성')
-  model_fn = model_fn_builder(
-      bert_config=bert_config,
-      init_checkpoint=FLAGS.init_checkpoint,
-      use_tpu=FLAGS.use_tpu,
-      use_one_hot_embeddings=FLAGS.use_tpu)
+  ids = tf.placeholder(tf.int32, shape=(1, len(tokenized_text)))
+  segments = tf.placeholder(tf.int32, shape=(token_len))
 
-  # If TPU is not available, this will fall back to normal Estimator on CPU
-  # or GPU.
-  tf.logging.info('estimator 생성')
-  estimator = tf.contrib.tpu.TPUEstimator(
-      use_tpu=FLAGS.use_tpu,
-      model_fn=model_fn,
-      config=run_config,
-      predict_batch_size=FLAGS.predict_batch_size)
+  model = modeling.BertModel(
+    config = bert_config,
+    is_training = False,
+    input_ids = ids,
+    token_type_ids = segments,
+    use_one_hot_embeddings = True)
 
+  with tf.Session() as sess:
+    replaced = []
+    for i in range(1):
+      for masked in np.arange(1, token_len, 1):
+        masked_index = masked
+        if masked_index in seps:
+          continue
+        if tokenized_text[masked_index].lstrip('##').isdigit():
+          continue
+        masked_id = indexed_tokens[masked_index]
+        tokenized_text[masked_index] = MASKED_TOKEN
+        indexed_tokens[masked_index] = MASKED_ID
 
-  predict_examples = read_examples(FLAGS.input_file)
-  features, all_tokens = convert_examples_to_features(predict_examples,
-                                          FLAGS.max_seq_length, tokenizer)
+        outputs = prediction(model, bert_config, [[masked_index]], [[masked_id]], scope=str(masked))
+        if i == 0:
+          sess.run(tf.global_variables_initializer())
+        outputs = sess.run(outputs, feed_dict={ids: [indexed_tokens], segments: segments_ids}) 
+        indexed_tokens[masked_index] = outputs["masked_lm_predictions"][0]
 
-  tf.logging.info("***** Running prediction*****")
-  tf.logging.info("  Num examples = %d", len(predict_examples))
-  tf.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
+        changed = tokenizer.convert_ids_to_tokens([masked_id, indexed_tokens[masked_index]])
+        print("{} / {}".format(changed[0], changed[1]))
 
-  if FLAGS.use_tpu:
-    # Warning: According to tpu_estimator.py Prediction on TPU is an
-    # experimental feature and hence not supported here
-    raise ValueError("Prediction in TPU not supported")
+        predicted_token = tokenizer.convert_ids_to_tokens(outputs["masked_lm_predictions"])[0]
+        replaced.append(predicted_token)
+        tokenized_text[masked_index] = predicted_token
+  
+  print(' '.join(tokenizer.convert_ids_to_tokens(indexed_tokens)))
 
-  predict_input_fn = input_fn_builder(
-      features=features,
-      seq_length=FLAGS.max_seq_length,
-      max_predictions_per_seq=FLAGS.max_predictions_per_seq)
+  #examples = read_examples(FLAGS.input_file)
+  #all_features, all_tokens = convert_examples_to_features(examples, FLAGS.max_seq_length, tokenizer)
+  #features = features_to_dict(all_features, FLAGS.max_seq_length, FLAGS.max_predictions_per_seq)
+  
+  
 
-  result = estimator.predict(input_fn=predict_input_fn)
-  output_predict_file = os.path.join(FLAGS.output_dir, "test_results.txt")
-  parse_result(result, all_tokens, features, output_predict_file)
+  #parse_result(output, all_tokens, all_features)
+
 
 if __name__ == "__main__":
   tf.app.run()
