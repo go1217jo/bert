@@ -444,11 +444,31 @@ def prediction(model, bert_config, masked_index, masked_id, scope=None):
       init_string = ", *INIT_FROM_CKPT*"
     
   masked_lm_log_probs = tf.reshape(masked_lm_log_probs, [-1, masked_lm_log_probs.shape[-1]])
-  masked_lm_predictions = tf.argmax(masked_lm_log_probs, axis=-1, output_type=tf.int32)
-  output = {"masked_lm_log_probs": masked_lm_log_probs,
-            "masked_lm_predictions": masked_lm_predictions }
-
+  #masked_lm_predictions = tf.argmax(masked_lm_log_probs, axis=-1, output_type=tf.int32)
+  output = masked_lm_log_probs
+            
   return output
+
+
+def beam_search_decoder(data, beam=1):
+	sequences = [[list(), 1.0]]
+	# walk over each step in sequence
+	for row in data:
+		all_candidates = list()
+		# expand each current candidate
+        # each step
+		for i in range(len(sequences)):
+			seq, score = sequences[i]
+      # check all likelihood about all words
+			#max_value = max(row)
+			for j in range(len(row)):
+				candidate = [seq + [j], score * -math.log(-1*(1.0/row[j]))]
+				all_candidates.append(candidate)
+		# order all candidates by score
+		ordered = sorted(all_candidates, key=lambda tup:tup[1])
+		# select k best
+		sequences = ordered[:beam]
+	return np.array(sequences[0][0])
 
 
 def main(_):
@@ -475,8 +495,9 @@ def main(_):
   
   tokenized_text.insert(0, '[CLS]')
   token_len = len(tokenized_text)
+  origin_text = ' '.join(tokenized_text)
   print(tokenized_text)
-
+  
   indexed_tokens = tokenizer.convert_tokens_to_ids(tokenized_text)
   seps = np.where(np.asarray(indexed_tokens) == 102)[0]
   print(seps)
@@ -497,7 +518,6 @@ def main(_):
     use_one_hot_embeddings = True)
 
   with tf.Session() as sess:
-    replaced = []
     for i in range(1):
       for masked in np.arange(1, token_len, 1):
         masked_index = masked
@@ -506,32 +526,32 @@ def main(_):
         if tokenized_text[masked_index].lstrip('##').isdigit():
           continue
         masked_id = indexed_tokens[masked_index]
+        masking_token = tokenized_text[masked_index]
         tokenized_text[masked_index] = MASKED_TOKEN
         indexed_tokens[masked_index] = MASKED_ID
 
         outputs = prediction(model, bert_config, [[masked_index]], [[masked_id]], scope=str(masked))
         if i == 0:
           sess.run(tf.global_variables_initializer())
+
         outputs = sess.run(outputs, feed_dict={ids: [indexed_tokens], segments: segments_ids}) 
-        indexed_tokens[masked_index] = outputs["masked_lm_predictions"][0]
+        
+        masked_lm_predictions = beam_search_decoder(outputs, beam=12)
+        #masked_lm_predictions = np.argmax(outputs, axis=-1)
+        indexed_tokens[masked_index] = masked_lm_predictions[0]
 
-        changed = tokenizer.convert_ids_to_tokens([masked_id, indexed_tokens[masked_index]])
-        print("{} / {}".format(changed[0], changed[1]))
-
-        predicted_token = tokenizer.convert_ids_to_tokens(outputs["masked_lm_predictions"])[0]
-        replaced.append(predicted_token)
+        predicted_token = tokenizer.convert_ids_to_tokens(masked_lm_predictions)[0]
         tokenized_text[masked_index] = predicted_token
-  
-  print(' '.join(tokenizer.convert_ids_to_tokens(indexed_tokens)))
 
-  #examples = read_examples(FLAGS.input_file)
-  #all_features, all_tokens = convert_examples_to_features(examples, FLAGS.max_seq_length, tokenizer)
-  #features = features_to_dict(all_features, FLAGS.max_seq_length, FLAGS.max_predictions_per_seq)
+        print("{} / {}".format(masking_token, predicted_token))
   
+  if not os.path.exists("results"):
+    os.makedirs("results")
+
+  with open("results/result3_beam_12.txt", "wt") as file:
+    file.write("[origin]\n" + origin_text)
+    file.write("\n[changed]\n" + ' '.join(tokenized_text))
   
-
-  #parse_result(output, all_tokens, all_features)
-
 
 if __name__ == "__main__":
   tf.app.run()
