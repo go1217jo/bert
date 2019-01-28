@@ -55,6 +55,10 @@ flags.DEFINE_string("vocab_file", None,
 
 # Other parameters
 
+flags.DEFINE_integer(
+	"beam_size", 1,
+	"set beam size.")
+
 flags.DEFINE_string(
 		"init_checkpoint", None,
 		"Initial checkpoint (usually from a pre-trained BERT model).")
@@ -438,22 +442,23 @@ def prediction(model, bert_config, masked_index, masked_id, scope=None):
 			bert_config, model.get_sequence_output(), model.get_embedding_table(),
 			tf.constant(masked_index, name="masked_lm_positions"),
 			tf.constant(masked_id, name="masked_lm_ids"), scope=scope)
-
+	"""
 	tvars = tf.trainable_variables()
 	if FLAGS.init_checkpoint:
 		(assignment_map, _) = modeling.get_assignment_map_from_checkpoint(tvars, FLAGS.init_checkpoint)
 	tf.train.init_from_checkpoint(FLAGS.init_checkpoint, assignment_map)
-
+	"""
 	masked_lm_log_probs = tf.reshape(masked_lm_log_probs, [-1, masked_lm_log_probs.shape[-1]])
 	output = masked_lm_log_probs
 
 	return output
 
 
-def beam_search_decoder(data, tokenizer, beam=1):
+def beam_search_decoder(data, beam=1):
+	print("\ndecoding...")
 	sequences = [[list(), 1.0]]
 	# walk over each step in sequence
-	for row in data:
+	for m, row in enumerate(data):
 		all_candidates = list()
 		# expand each current candidate
 		for i in range(len(sequences)):
@@ -467,6 +472,7 @@ def beam_search_decoder(data, tokenizer, beam=1):
 		ordered=sorted(all_candidates, key=lambda tup: tup[1])
 		# select k best
 		sequences=ordered[:beam]
+		print("\r{}".format(m), end='')
 
 	return sequences
 
@@ -490,6 +496,8 @@ def main(_):
 	lines=[line.rstrip('\n') for line in open(FLAGS.input_file)]
 	tokenized_text=[]
 	for line in lines:
+		if line == '':
+			continue
 		tokenized_text=tokenized_text + tokenizer.tokenize(line)
 		tokenized_text.append('[SEP]')
 
@@ -517,66 +525,65 @@ def main(_):
 		token_type_ids=segments,
 		use_one_hot_embeddings=True)
 			
+	skiped_index = []
+	
 	with tf.Session() as sess:
-		# step
-		for i in range(1, token_len):
-			prob = None
-			print("\ncurrent: {}".format(tokenized_text))
-			print("\nstep {}".format(i))
-			print("0 / {}".format(token_len), end='')
-			masking_token=tokenized_text[i]
-			processing_text=copy.deepcopy(tokenized_text)
-			# sequential masking in each step
-			for masked in np.arange(i, token_len, 1):
-				masked_index = masked
-				# skip [SEP] or number subtoken
-				if masked_index in seps or processing_text[masked_index].lstrip('##').isdigit():
-					continue
-				
-				# 원래 토큰 저장
-				origin_token=processing_text[masked_index]
-				# 마스크 되기 전 id
-				masked_id=indexed_tokens[masked_index]
-				# masking
-				processing_text[masked_index]=MASKED_TOKEN
-				indexed_tokens[masked_index]=MASKED_ID
+		prob = None
+		print("\ncurrent: {}".format(tokenized_text))
+		# sequential masking in each step
+		for masked in np.arange(1, token_len, 1):
+			masked_index = masked
+			# skip [SEP] or number subtoken
+			if masked_index in seps or tokenized_text[masked_index].lstrip('##').isdigit():
+				skiped_index.append(masked)
+				continue
+			
+			# 원래 토큰 저장
+			origin_token=tokenized_text[masked_index]
+			# 마스크 되기 전 id
+			masked_id=indexed_tokens[masked_index]
+			# masking
+			tokenized_text[masked_index]=MASKED_TOKEN
+			indexed_tokens[masked_index]=MASKED_ID
 
-				# prediction
-				outputs=prediction(model, bert_config, [[masked_index]], [[masked_id]], scope=str(masked))
-				if i == 1:
-					sess.run(tf.global_variables_initializer())
-				outputs=sess.run(outputs, feed_dict={ ids: [indexed_tokens], segments: segments_ids })
+			# prediction
+			outputs=prediction(model, bert_config, [[masked_index]], [[masked_id]], scope=str(masked))
+			if masked == 1:
+				tvars = tf.trainable_variables()
+				if FLAGS.init_checkpoint:
+					(assignment_map, _) = modeling.get_assignment_map_from_checkpoint(tvars, FLAGS.init_checkpoint)
+				tf.train.init_from_checkpoint(FLAGS.init_checkpoint, assignment_map)
+				sess.run(tf.global_variables_initializer())
+			outputs=sess.run(outputs, feed_dict={ ids: [indexed_tokens], segments: segments_ids })
 
-				# 다시 원상 복구
-				processing_text[masked_index] = origin_token
-				indexed_tokens[masked_index] = masked_id
+			indexed_tokens[masked_index] = masked_id
+			tokenized_text[masked_index] = origin_token
+			
+			# stack probability distribution
+			if type(prob) == np.ndarray:
+				prob = np.vstack((prob, outputs))
+			else:
+				prob = outputs
+			print("\r{} / {}".format(masked, token_len), end='')
 
-				# stack probability distribution
-				if type(prob) == np.ndarray:
-					prob = np.vstack((prob, outputs))
-				else:
-					prob = outputs
-				print("\r{} / {}".format(masked, token_len), end='')
-
-			decoded=beam_search_decoder(prob, tokenizer, beam=5)
-			masked_lm_predictions=decoded[0][0]
-			indexed_tokens[i]=masked_lm_predictions[0]
-			predicted_token=tokenizer.convert_ids_to_tokens(masked_lm_predictions)
-			tokenized_text[i]=predicted_token[0]
-
-			for k, seq in enumerate(decoded):
-				print('\n{} candidate:\n{}'.format(
-						k, tokenizer.convert_ids_to_tokens(seq[0])))
-
-			print("{} / {}".format(masking_token, predicted_token[0]))
-
+		decoded=beam_search_decoder(prob, beam=FLAGS.beam_size)
+		
 	if not os.path.exists("results"):
 		os.makedirs("results")
 
-	with open("results/other_result3_beam_5.txt", "wt") as file:
+	with open("results/cnn_all_3way_beam_" + str(FLAGS.beam_size) + ".txt", "wt") as file:
 		file.write("[origin]\n" + origin_text)
-		file.write("\n[changed]\n" + ' '.join(tokenized_text))
-
+		for k, seq in enumerate(decoded):
+			tokens = tokenizer.convert_ids_to_tokens(seq[0])
+			n = 0
+			for idx in range(1, len(tokenized_text)-1):
+				if idx in skiped_index:
+					continue
+				tokenized_text[idx] = tokens[n]
+				n+=1
+			file.write('\n{} candidate:'.format(k))
+			for to in tokenized_text:
+				file.write('{} '.format(to))
 
 if __name__ == "__main__":
 	tf.app.run()
