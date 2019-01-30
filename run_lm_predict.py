@@ -454,25 +454,28 @@ def prediction(model, bert_config, masked_index, masked_id, scope=None):
 	return output
 
 
-def beam_search_decoder(data, beam=1):
+def beam_search_decoder(data, tokenizer, alpha=1., beam=1):
 	print("\ndecoding...")
 	sequences = [[list(), 1.0]]
 	# walk over each step in sequence
 	for m, row in enumerate(data):
 		all_candidates = list()
 		# expand each current candidate
+		Ty = math.pow(float(len(sequences)), alpha)
 		for i in range(len(sequences)):
 			seq, score = sequences[i]
+			sum_value = sum(row)
 			#check all likelihood about all words
-			max_value = max(row)
 			for j in range(len(row)):
-				candidate = [seq + [j], score * (row[j] / (float(max_value)*2))]
+				candidate = [seq + [j], 1./Ty * score * -math.log(row[j]/sum_value)]
 				all_candidates.append(candidate)
 		# order all candidates by score
-		ordered=sorted(all_candidates, key=lambda tup: tup[1])
+		ordered=sorted(all_candidates, key=lambda tup: tup[1], reverse=True)
+		for k in range(10):
+			print(tokenizer.convert_ids_to_tokens(ordered[k][0]))
 		# select k best
 		sequences=ordered[:beam]
-		print("\r{}".format(m), end='')
+		print("\r{}".format(m), end='\n')
 
 	return sequences
 
@@ -565,13 +568,13 @@ def main(_):
 			else:
 				prob = outputs
 			print("\r{} / {}".format(masked, token_len), end='')
-
-		decoded=beam_search_decoder(prob, beam=FLAGS.beam_size)
 		
+	decoded = beam_search_decoder(prob, tokenizer, alpha=0.7, beam=FLAGS.beam_size)	
+	
 	if not os.path.exists("results"):
 		os.makedirs("results")
 
-	with open("results/cnn_all_3way_beam_" + str(FLAGS.beam_size) + ".txt", "wt") as file:
+	with open("results/cnn_3_3way_alpha_0.7_beam_" + str(FLAGS.beam_size) + ".txt", "wt") as file:
 		file.write("[origin]\n" + origin_text)
 		for k, seq in enumerate(decoded):
 			tokens = tokenizer.convert_ids_to_tokens(seq[0])
